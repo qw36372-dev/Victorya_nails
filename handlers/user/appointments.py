@@ -39,11 +39,12 @@ async def cb_my_appointments(cb: CallbackQuery, state: FSMContext):
     text = "📋 <b>Ваши записи:</b>\n\n"
     for apt in appointments:
         date_obj = datetime.strptime(apt["date"], "%Y-%m-%d")
+        status = "⏳ Ожидает подтверждения" if apt["status"] == "pending" else "✅ Подтверждена"
         text += (
             f"📌 <b>{apt['service_name']}</b>\n"
-            f"   👩 {apt['master_name']}\n"
             f"   📅 {DAY_NAMES_SHORT[date_obj.weekday()]} {date_obj.strftime('%d.%m.%Y')} в {apt['time']}\n"
-            f"   💰 {apt['price']}₽\n\n"
+            f"   💰 {apt['price']}₽\n"
+            f"   {status}\n\n"
         )
 
     await cb.message.edit_text(

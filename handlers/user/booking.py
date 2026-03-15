@@ -1,39 +1,56 @@
 """
 handlers/user/booking.py — полный сценарий записи клиента (один мастер)
 
-Шаги: услуга → дата → время → имя (если новый) → телефон (если новый) → пожелания → подтверждение
-Шаг выбора мастера исключён — мастер всегда единственный.
+Шаги: услуга → календарь → время → имя → телефон → пожелания → подтверждение
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from keyboards.inline import (
-    back_kb, confirm_booking_kb, after_booking_kb,
-    dates_kb, notes_kb, services_kb, times_kb,
+    back_kb, calendar_kb, confirm_booking_kb, after_booking_kb,
+    notes_kb, services_kb, times_kb,
 )
 from keyboards.reply import phone_request_kb, remove_kb
 from services.calculator import calc_end_time
-from services.notifications import notify_channel_new, send_reminder
-from services.schedule import get_available_slots, get_next_working_days
+from services.notifications import notify_channel_new
+from services.schedule import get_available_dates_in_month, get_available_slots
 from states import Booking
 from storage.database import db
 
 router = Router()
 
-DAY_NAMES_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-DAY_NAMES_FULL  = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+DAY_NAMES_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
 
 def _get_sole_master() -> dict:
-    """Возвращает единственного мастера из БД"""
     masters = db.get_all_masters()
     return masters[0] if masters else {"id": 1, "name": "Мастер"}
+
+
+# ── Вспомогательная функция: показать календарь ───────────────────────────────
+
+async def _show_calendar(target, state: FSMContext, year: int, month: int, edit: bool = True):
+    await state.set_state(Booking.select_date)
+    data      = await state.get_data()
+    available = get_available_dates_in_month(year, month, data["master_id"], data["service_duration"])
+
+    text = (
+        f"✅ Услуга: <b>{data['service_name']}</b>\n"
+        f"⏱ Длительность: {data['service_duration']} мин.\n"
+        f"💰 Стоимость: {data['service_price']}₽\n\n"
+        f"📅 <b>Выберите дату:</b>\n"
+        f"<i>Цифра — свободно   ✗ — занято   · — недоступно</i>"
+    )
+    kb = calendar_kb(year, month, available, data["service_id"])
+
+    if edit and isinstance(target, Message):
+        await target.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ── 1. Выбор услуги ──────────────────────────────────────────────────────────
@@ -54,9 +71,7 @@ async def cb_book(cb: CallbackQuery, state: FSMContext):
 async def cb_select_service(cb: CallbackQuery, state: FSMContext):
     service_id = int(cb.data.split("_")[1])
     service    = db.get_service(service_id)
-
-    # Автоматически берём единственного мастера
-    master = _get_sole_master()
+    master     = _get_sole_master()
 
     await state.update_data(
         service_id=service_id,
@@ -66,21 +81,35 @@ async def cb_select_service(cb: CallbackQuery, state: FSMContext):
         master_id=master["id"],
         master_name=master["name"],
     )
-    await state.set_state(Booking.select_date)
 
-    dates = get_next_working_days(7)
-    await cb.message.edit_text(
-        f"✅ Услуга: <b>{service['name']}</b>\n"
-        f"⏱ Длительность: {service['duration']} мин.\n"
-        f"💰 Стоимость: {service['price']}₽\n\n"
-        f"📅 <b>Выберите дату:</b>",
-        reply_markup=dates_kb(dates, back_cb="book"),
-        parse_mode=ParseMode.HTML,
-    )
+    today = date.today()
+    await _show_calendar(cb.message, state, today.year, today.month, edit=True)
     await cb.answer()
 
 
-# ── 2. Выбор даты ─────────────────────────────────────────────────────────────
+# ── 2. Навигация по месяцам ───────────────────────────────────────────────────
+
+@router.callback_query(Booking.select_date, F.data.startswith("cal_nav_"))
+async def cb_cal_nav(cb: CallbackQuery, state: FSMContext):
+    _, _, y, m = cb.data.split("_")
+    year, month = int(y), int(m)
+
+    today = date.today()
+    # Защита от ухода в прошлое
+    if (year, month) < (today.year, today.month):
+        await cb.answer("Нельзя выбрать прошедший месяц", show_alert=False)
+        return
+
+    await _show_calendar(cb.message, state, year, month, edit=True)
+    await cb.answer()
+
+
+@router.callback_query(Booking.select_date, F.data == "cal_noop")
+async def cb_cal_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+# ── 3. Выбор даты ─────────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.select_date, F.data.startswith("date_"))
 async def cb_select_date(cb: CallbackQuery, state: FSMContext):
@@ -93,11 +122,8 @@ async def cb_select_date(cb: CallbackQuery, state: FSMContext):
     available = get_available_slots(date_str, data["service_duration"], booked)
 
     if not available:
-        await cb.message.edit_text(
-            "😔 К сожалению, на выбранную дату все слоты заняты.\nПожалуйста, выберите другую дату.",
-            reply_markup=back_kb(f"service_{data['service_id']}"),
-        )
-        await cb.answer()
+        await cb.answer("😔 На этот день все слоты уже заняты", show_alert=True)
+        await state.set_state(Booking.select_date)
         return
 
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -111,7 +137,7 @@ async def cb_select_date(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ── 3. Выбор времени ──────────────────────────────────────────────────────────
+# ── 4. Выбор времени ──────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.select_time, F.data.startswith("time_"))
 async def cb_select_time(cb: CallbackQuery, state: FSMContext):
@@ -132,7 +158,7 @@ async def cb_select_time(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ── 4. Имя ────────────────────────────────────────────────────────────────────
+# ── 5. Имя ────────────────────────────────────────────────────────────────────
 
 @router.message(Booking.enter_name, F.text)
 async def msg_enter_name(message: Message, state: FSMContext):
@@ -150,7 +176,7 @@ async def msg_enter_name(message: Message, state: FSMContext):
     )
 
 
-# ── 5. Телефон ────────────────────────────────────────────────────────────────
+# ── 6. Телефон ────────────────────────────────────────────────────────────────
 
 @router.message(Booking.enter_phone, F.contact | F.text)
 async def msg_enter_phone(message: Message, state: FSMContext):
@@ -175,7 +201,7 @@ async def msg_enter_phone(message: Message, state: FSMContext):
     await _ask_notes(message, state, edit=False)
 
 
-# ── 6. Пожелания / комментарий ───────────────────────────────────────────────
+# ── 7. Пожелания ─────────────────────────────────────────────────────────────
 
 async def _ask_notes(target, state: FSMContext, edit: bool = False):
     await state.set_state(Booking.enter_notes)
@@ -208,7 +234,7 @@ async def cb_notes_skip(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ── 7. Подтверждение ─────────────────────────────────────────────────────────
+# ── 8. Подтверждение ─────────────────────────────────────────────────────────
 
 async def _show_confirmation(target, state: FSMContext, user_info: dict, edit: bool = False):
     data     = await state.get_data()
@@ -234,10 +260,10 @@ async def _show_confirmation(target, state: FSMContext, user_info: dict, edit: b
         await target.answer(text, reply_markup=confirm_booking_kb(), parse_mode=ParseMode.HTML)
 
 
-# ── 8. Запись создана ────────────────────────────────────────────────────────
+# ── 9. Запись создана ────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.confirm, F.data == "confirm_booking")
-async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot, scheduler: AsyncIOScheduler):
+async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot):
     data      = await state.get_data()
     user_id   = cb.from_user.id
     user_info = db.get_user_info(user_id)
@@ -253,26 +279,13 @@ async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot, sch
         notes=data.get("notes", ""),
     )
 
-    # Планируем напоминания
-    from datetime import timedelta
-    apt_dt = datetime.strptime(f"{data['date']} {data['time']}", "%Y-%m-%d %H:%M")
-    for hours, label in [(24, "24h"), (2, "2h")]:
-        run_at = apt_dt - timedelta(hours=hours)
-        if run_at > datetime.now():
-            scheduler.add_job(
-                send_reminder, "date", run_date=run_at,
-                args=[bot, user_id, apt_id, label],
-                id=f"reminder_{label}_{apt_id}", replace_existing=True,
-            )
-
     date_obj = datetime.strptime(data["date"], "%Y-%m-%d")
     await cb.message.edit_text(
-        f"🎉 <b>Запись успешно создана!</b>\n\n"
+        f"📋 <b>Заявка принята!</b>\n\n"
         f"💅 Услуга: <b>{data['service_name']}</b>\n"
         f"📅 <b>{DAY_NAMES_FULL[date_obj.weekday()]}, {date_obj.strftime('%d.%m.%Y')} в {data['time']}</b>\n\n"
-        f"🔔 Я пришлю напоминание за 24 часа и за 2 часа до визита.\n"
-        f"⏳ <i>Свяжусь с вами для подтверждения в течение 1 часа.</i>\n\n"
-        f"Жду вас! 💅🌸",
+        f"⏳ <i>Ожидайте подтверждения — я свяжусь с вами в течение 1 часа.</i>\n\n"
+        f"Как только подтвержу запись, вы получите уведомление. 💅",
         reply_markup=after_booking_kb(),
         parse_mode=ParseMode.HTML,
     )

@@ -8,7 +8,7 @@ from aiogram.types import CallbackQuery
 
 from config import (
     SALON_NAME, SALON_ADDRESS, SALON_PHONE,
-    SALON_WHATSAPP, SALON_INSTAGRAM, SALON_METRO, WORK_HOURS,
+    SALON_WHATSAPP, SALON_INSTAGRAM, SALON_BUS, WORK_HOURS,
 )
 from keyboards.inline import info_kb
 from storage.database import db
@@ -40,7 +40,7 @@ async def cb_contacts(cb: CallbackQuery):
         f"📞 Телефон: {SALON_PHONE}\n"
         f"📱 WhatsApp: {SALON_WHATSAPP}\n"
         f"📷 Instagram: {SALON_INSTAGRAM}\n\n"
-        f"🚇 {SALON_METRO}\n"
+        f"🚌 {SALON_BUS}\n"
         f"🅿️ Есть бесплатная парковка",
         reply_markup=info_kb(),
         parse_mode=ParseMode.HTML,

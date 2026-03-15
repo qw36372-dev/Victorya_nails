@@ -143,8 +143,8 @@ class Database:
         internal_user_id = user_row["id"] if user_row else None
         row = self._exec("""
             INSERT INTO appointments
-                (user_id, service_id, master_id, date, time, client_name, client_phone, notes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (user_id, service_id, master_id, date, time, client_name, client_phone, notes, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')
             RETURNING id
         """, (internal_user_id, service_id, master_id, date, time, client_name, client_phone, notes),
             fetch="one",
@@ -171,7 +171,7 @@ class Database:
             JOIN users    u ON a.user_id    = u.id
             JOIN services s ON a.service_id = s.id
             JOIN masters  m ON a.master_id  = m.id
-            WHERE u.telegram_id = %s AND a.status = 'active'
+            WHERE u.telegram_id = %s AND a.status IN ('active', 'pending')
               AND (a.date::date > CURRENT_DATE
                    OR (a.date::date = CURRENT_DATE AND a.time::time >= CURRENT_TIME))
             ORDER BY a.date, a.time
@@ -230,6 +230,24 @@ class Database:
         """, (master_id, date), fetch="all")
         return [dict(r) for r in rows] if rows else []
 
+    def confirm_appointment(self, appointment_id: int):
+        self._exec(
+            "UPDATE appointments SET status = 'active' WHERE id = %s", (appointment_id,)
+        )
+
+    def reschedule_appointment(self, appointment_id: int, new_date: str, new_time: str):
+        self._exec(
+            "UPDATE appointments SET date = %s, time = %s WHERE id = %s",
+            (new_date, new_time, appointment_id),
+        )
+
+    def get_pending_appointments(self) -> list:
+        rows = self._exec(
+            "SELECT * FROM appointments WHERE status = 'pending' ORDER BY created_at",
+            fetch="all"
+        )
+        return [dict(r) for r in rows] if rows else []
+
     # ── Статистика ───────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
@@ -238,6 +256,9 @@ class Database:
             "total_appointments": self._exec("SELECT COUNT(*) FROM appointments", fetch="scalar") or 0,
             "active_appointments": self._exec(
                 "SELECT COUNT(*) FROM appointments WHERE status='active'", fetch="scalar"
+            ) or 0,
+            "pending_appointments": self._exec(
+                "SELECT COUNT(*) FROM appointments WHERE status='pending'", fetch="scalar"
             ) or 0,
             "cancelled_appointments": self._exec(
                 "SELECT COUNT(*) FROM appointments WHERE status='cancelled'", fetch="scalar"

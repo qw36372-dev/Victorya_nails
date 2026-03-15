@@ -2,11 +2,18 @@
 keyboards/inline.py — все inline-клавиатуры бота
 """
 
+import calendar
+from datetime import date
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import ADMIN_IDS
 
 DAY_NAMES_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTH_NAMES = [
+    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
 
 
 # ── Общие ────────────────────────────────────────────────────────────────────
@@ -63,19 +70,71 @@ def masters_kb(masters: list, back_cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ── Запись: даты ──────────────────────────────────────────────────────────────
+# ── Запись: календарь ─────────────────────────────────────────────────────────
 
-def dates_kb(dates: list, back_cb: str) -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for i, date in enumerate(dates):
-        row.append(InlineKeyboardButton(
-            text=f"{DAY_NAMES_SHORT[date.weekday()]} {date.strftime('%d.%m')}",
-            callback_data=f"date_{date.strftime('%Y-%m-%d')}",
-        ))
-        if len(row) == 3 or i == len(dates) - 1:
-            rows.append(row)
-            row = []
-    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=back_cb)])
+def calendar_kb(year: int, month: int, available_dates: set, service_id: int) -> InlineKeyboardMarkup:
+    """
+    Полноценный календарь на месяц с навигацией.
+    ✅ — есть свободные слоты  ✗ — все занято  · — прошедший/выходной
+    """
+    today = date.today()
+    rows  = []
+
+    # ── Навигация: < Март 2026 > ─────────────────────────────────────────────
+    prev_m = month - 1 if month > 1 else 12
+    prev_y = year if month > 1 else year - 1
+    next_m = month + 1 if month < 12 else 1
+    next_y = year if month < 12 else year + 1
+
+    # Максимум — 12 месяцев вперёд от сегодня
+    max_m     = today.month + 12
+    max_year  = today.year + (max_m - 1) // 12
+    max_month = (max_m - 1) % 12 + 1
+
+    # ◀️ — можно, если предыдущий месяц не раньше текущего
+    can_prev = (prev_y, prev_m) >= (today.year, today.month)
+    # ▶️ — можно, если следующий месяц не позже максимума
+    can_next = (next_y, next_m) <= (max_year, max_month)
+
+    rows.append([
+        InlineKeyboardButton(
+            text="◀️" if can_prev else " ",
+            callback_data=f"cal_nav_{prev_y}_{prev_m}" if can_prev else "cal_noop",
+        ),
+        InlineKeyboardButton(
+            text=f"{MONTH_NAMES[month]} {year}",
+            callback_data="cal_noop",
+        ),
+        InlineKeyboardButton(
+            text="▶️" if can_next else " ",
+            callback_data=f"cal_nav_{next_y}_{next_m}" if can_next else "cal_noop",
+        ),
+    ])
+
+    # ── Заголовки дней ────────────────────────────────────────────────────────
+    rows.append([
+        InlineKeyboardButton(text=d, callback_data="cal_noop")
+        for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    ])
+
+    # ── Дни месяца ────────────────────────────────────────────────────────────
+    for week in calendar.monthcalendar(year, month):
+        row = []
+        for weekday, day in enumerate(week):
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="cal_noop"))
+                continue
+            d        = date(year, month, day)
+            date_str = d.strftime("%Y-%m-%d")
+            if d <= today or weekday == 6:           # прошедшее или воскресенье
+                row.append(InlineKeyboardButton(text="·", callback_data="cal_noop"))
+            elif date_str in available_dates:        # есть свободные слоты
+                row.append(InlineKeyboardButton(text=str(day), callback_data=f"date_{date_str}"))
+            else:                                    # всё занято
+                row.append(InlineKeyboardButton(text="✗", callback_data="cal_noop"))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"service_{service_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -133,8 +192,8 @@ def appointments_kb(appointments: list) -> InlineKeyboardMarkup:
 
 def confirm_cancel_kb(apt_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, отменить",  callback_data="confirm_cancel")],
-        [InlineKeyboardButton(text="🔙 Назад",          callback_data="my_appointments")],
+        [InlineKeyboardButton(text="✅ Да, отменить", callback_data="confirm_cancel")],
+        [InlineKeyboardButton(text="🔙 Назад",         callback_data="my_appointments")],
     ])
 
 
@@ -150,7 +209,9 @@ def info_kb() -> InlineKeyboardMarkup:
 # ── Канал: кнопки мастера ────────────────────────────────────────────────────
 
 def channel_buttons_kb(tg_id: int, phone: str) -> InlineKeyboardMarkup:
-    phone_clean = phone.replace(" ", "").replace("-", "")
+    # Очищаем номер от всех нецифровых символов, кроме ведущего +
+    digits   = "".join(filter(str.isdigit, phone))
+    phone_clean = f"+{digits}"
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✉️ Написать клиенту", url=f"tg://user?id={tg_id}"),
         InlineKeyboardButton(text="📞 Позвонить",         url=f"tel:{phone_clean}"),
@@ -182,10 +243,10 @@ def block_masters_kb(masters: list) -> InlineKeyboardMarkup:
 
 def block_dates_kb(dates: list, master_id: int) -> InlineKeyboardMarkup:
     rows, row = [], []
-    for i, date in enumerate(dates):
+    for i, d in enumerate(dates):
         row.append(InlineKeyboardButton(
-            text=f"{DAY_NAMES_SHORT[date.weekday()]} {date.strftime('%d.%m')}",
-            callback_data=f"block_date_{date.strftime('%Y-%m-%d')}",
+            text=f"{DAY_NAMES_SHORT[d.weekday()]} {d.strftime('%d.%m')}",
+            callback_data=f"block_date_{d.strftime('%Y-%m-%d')}",
         ))
         if len(row) == 3 or i == len(dates) - 1:
             rows.append(row)

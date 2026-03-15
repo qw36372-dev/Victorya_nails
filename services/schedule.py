@@ -6,6 +6,18 @@ import calendar
 from datetime import date, datetime, timedelta
 
 
+def get_next_working_days(count: int = 7) -> list:
+    """Возвращает count рабочих дней (Пн–Сб), начиная с завтрашнего"""
+    from datetime import timedelta
+    dates   = []
+    current = datetime.now()
+    while len(dates) < count:
+        current += timedelta(days=1)
+        if current.weekday() < 6:   # 0–5 = Пн–Сб
+            dates.append(current)
+    return dates
+
+
 def get_all_slots(date_str: str, start: str = "09:00", end: str = "20:00", step: int = 30) -> list[str]:
     """Все слоты с шагом step минут в рабочем диапазоне"""
     slot   = datetime.strptime(f"{date_str} {start}", "%Y-%m-%d %H:%M")

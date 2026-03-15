@@ -39,5 +39,5 @@ SALON_ADDRESS   = "Батайск, Октябрьская улица, 129 • н
 SALON_PHONE     = "+7 (900) 123-45-67"
 SALON_WHATSAPP  = "+7 (900) 123-45-67"
 SALON_INSTAGRAM = "@vic_nails"
-SALON_BUS     = "остановка "почта", 3 мин пешком"
+SALON_BUS       = "остановка 'почта', 3 мин пешком"
 WORK_HOURS      = "Пн-Сб 9:00 – 20:00, Вс — выходной"

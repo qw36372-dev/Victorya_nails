@@ -7,13 +7,16 @@ from aiogram.fsm.state import State, StatesGroup
 
 class Booking(StatesGroup):
     """Сценарий записи клиента"""
-    select_service = State()
-    select_date    = State()
-    select_time    = State()
-    enter_name     = State()
-    enter_phone    = State()
-    enter_notes    = State()
-    confirm        = State()
+    select_service  = State()
+    select_date     = State()
+    select_time     = State()
+    choose_client   = State()   # для себя или для другого
+    enter_name      = State()   # новый клиент — своё имя
+    enter_phone     = State()   # новый клиент — свой телефон
+    enter_other_name  = State() # запись для другого — имя
+    enter_other_phone = State() # запись для другого — телефон
+    enter_notes     = State()
+    confirm         = State()
 
 
 class MyAppointments(StatesGroup):

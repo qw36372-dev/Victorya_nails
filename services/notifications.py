@@ -89,7 +89,6 @@ async def notify_channel_new(bot: Bot, apt_id: int, user_id: int, data: dict, us
         ],
         [
             InlineKeyboardButton(text="✉️ Написать клиенту", url=f"tg://user?id={user_id}"),
-            InlineKeyboardButton(text="📞 Позвонить",         url=f"tel:+{''.join(filter(str.isdigit, user_info['phone']))}"),
         ],
     ])
 
@@ -97,7 +96,8 @@ async def notify_channel_new(bot: Bot, apt_id: int, user_id: int, data: dict, us
         await bot.send_message(
             LEADS_CHANNEL_ID,
             f"🆕 <b>Новая заявка на запись! #{apt_id}</b>\n\n"
-            f"👤 {user_info['name']} ({user_info['phone']})\n"
+            f"👤 {user_info['name']}\n"
+            f"📞 {user_info['phone']}\n"
             f"💅 {data['service_name']}\n"
             f"📅 {DAY_NAMES_FULL[date_obj.weekday()]}, {date_obj.strftime('%d.%m.%Y')} в {data['time']}"
             f"{notes_line}\n\n"
@@ -117,7 +117,6 @@ async def notify_channel_cancel(bot: Bot, apt: dict):
     digits    = "".join(filter(str.isdigit, apt["client_phone"]))
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✉️ Написать клиенту", url=f"tg://user?id={client_tg}"),
-        InlineKeyboardButton(text="📞 Позвонить",         url=f"tel:+{digits}"),
     ]])
     try:
         await bot.send_message(

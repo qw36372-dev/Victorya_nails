@@ -1,7 +1,7 @@
 """
 handlers/user/booking.py — полный сценарий записи клиента (один мастер)
 
-Шаги: услуга → календарь → время → имя → телефон → пожелания → подтверждение
+Шаги: услуга → календарь → время → для кого? → имя/телефон → пожелания → подтверждение
 """
 
 from datetime import date, datetime
@@ -9,7 +9,8 @@ from datetime import date, datetime
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
 from keyboards.inline import (
     back_kb, calendar_kb, confirm_booking_kb, after_booking_kb,
     notes_kb, services_kb, times_kb,
@@ -31,7 +32,7 @@ def _get_sole_master() -> dict:
     return masters[0] if masters else {"id": 1, "name": "Мастер"}
 
 
-# ── Вспомогательная функция: показать календарь ───────────────────────────────
+# ── Вспомогательная: показать календарь ──────────────────────────────────────
 
 async def _show_calendar(target, state: FSMContext, year: int, month: int, edit: bool = True):
     await state.set_state(Booking.select_date)
@@ -92,15 +93,11 @@ async def cb_select_service(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(Booking.select_date, F.data.startswith("cal_nav_"))
 async def cb_cal_nav(cb: CallbackQuery, state: FSMContext):
     _, _, y, m = cb.data.split("_")
-    year, month = int(y), int(m)
-
     today = date.today()
-    # Защита от ухода в прошлое
-    if (year, month) < (today.year, today.month):
-        await cb.answer("Нельзя выбрать прошедший месяц", show_alert=False)
+    if (int(y), int(m)) < (today.year, today.month):
+        await cb.answer()
         return
-
-    await _show_calendar(cb.message, state, year, month, edit=True)
+    await _show_calendar(cb.message, state, int(y), int(m), edit=True)
     await cb.answer()
 
 
@@ -137,7 +134,7 @@ async def cb_select_date(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ── 4. Выбор времени ──────────────────────────────────────────────────────────
+# ── 4. Выбор времени → для кого? ─────────────────────────────────────────────
 
 @router.callback_query(Booking.select_time, F.data.startswith("time_"))
 async def cb_select_time(cb: CallbackQuery, state: FSMContext):
@@ -146,19 +143,92 @@ async def cb_select_time(cb: CallbackQuery, state: FSMContext):
 
     user_info = db.get_user_info(cb.from_user.id)
     if user_info and user_info.get("phone"):
-        await state.update_data(client_name=user_info["name"], client_phone=user_info["phone"])
-        await _ask_notes(cb.message, state, edit=True)
+        # Знаем клиента — предлагаем выбор: для себя или для другого
+        await state.update_data(saved_name=user_info["name"], saved_phone=user_info["phone"])
+        await state.set_state(Booking.choose_client)
+        await cb.message.edit_text(
+            "👤 <b>Для кого запись?</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"👤 Для себя ({user_info['name']})",
+                    callback_data="client_self",
+                )],
+                [InlineKeyboardButton(
+                    text="👥 Для другого человека",
+                    callback_data="client_other",
+                )],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
     else:
+        # Новый клиент — сразу спрашиваем имя
         await state.set_state(Booking.enter_name)
         await cb.message.edit_text(
-            "📝 <b>Введите ваше имя:</b>\n\nКак к вам обращаться?",
+            "📝 <b>Введите ваше имя:</b>\n\nКак к вам обращаться?\n\n"
+            "⚠️ <i>Имя и телефон сохранятся для ваших будущих записей. "
+            "Удалить их можно в любой момент через главное меню.</i>",
             reply_markup=back_kb("book"),
             parse_mode=ParseMode.HTML,
         )
     await cb.answer()
 
 
-# ── 5. Имя ────────────────────────────────────────────────────────────────────
+# ── 4а. Для себя ──────────────────────────────────────────────────────────────
+
+@router.callback_query(Booking.choose_client, F.data == "client_self")
+async def cb_client_self(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(client_name=data["saved_name"], client_phone=data["saved_phone"])
+    await _ask_notes(cb.message, state, edit=True)
+    await cb.answer()
+
+
+# ── 4б. Для другого — запрашиваем имя ────────────────────────────────────────
+
+@router.callback_query(Booking.choose_client, F.data == "client_other")
+async def cb_client_other(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Booking.enter_other_name)
+    await cb.message.edit_text(
+        "📝 <b>Введите имя человека, для которого запись:</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+# ── 4в. Имя другого человека ──────────────────────────────────────────────────
+
+@router.message(Booking.enter_other_name, F.text)
+async def msg_enter_other_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("❗ Пожалуйста, введите корректное имя (минимум 2 символа).")
+        return
+    await state.update_data(client_name=name)
+    await state.set_state(Booking.enter_other_phone)
+    await message.answer(
+        "📱 <b>Введите номер телефона этого человека:</b>\n\n"
+        "Например: +79001234567",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── 4г. Телефон другого человека ─────────────────────────────────────────────
+
+@router.message(Booking.enter_other_phone, F.text)
+async def msg_enter_other_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    if len("".join(filter(str.isdigit, phone))) < 10:
+        await message.answer("❗ Пожалуйста, введите корректный номер телефона.")
+        return
+    # Нормализуем номер
+    digits = "".join(filter(str.isdigit, phone))
+    phone  = f"+{digits}"
+    # Сохраняем данные другого человека — в таблицу users НЕ пишем
+    await state.update_data(client_phone=phone)
+    await _ask_notes(message, state, edit=False)
+
+
+# ── 5. Имя (новый клиент) ─────────────────────────────────────────────────────
 
 @router.message(Booking.enter_name, F.text)
 async def msg_enter_name(message: Message, state: FSMContext):
@@ -176,7 +246,7 @@ async def msg_enter_name(message: Message, state: FSMContext):
     )
 
 
-# ── 6. Телефон ────────────────────────────────────────────────────────────────
+# ── 6. Телефон (новый клиент) ─────────────────────────────────────────────────
 
 @router.message(Booking.enter_phone, F.contact | F.text)
 async def msg_enter_phone(message: Message, state: FSMContext):
@@ -195,6 +265,7 @@ async def msg_enter_phone(message: Message, state: FSMContext):
 
     data = await state.get_data()
     name = data.get("client_name", message.from_user.first_name)
+    # Сохраняем в БД — это данные самого клиента
     db.update_user_contact(message.from_user.id, name, phone)
     await state.update_data(client_phone=phone)
     await message.answer("✅", reply_markup=remove_kb())
@@ -266,7 +337,6 @@ async def _show_confirmation(target, state: FSMContext, user_info: dict, edit: b
 async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot):
     data      = await state.get_data()
     user_id   = cb.from_user.id
-    user_info = db.get_user_info(user_id)
 
     apt_id = db.create_appointment(
         user_id=user_id,
@@ -274,12 +344,14 @@ async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot):
         master_id=data["master_id"],
         date=data["date"],
         time=data["time"],
-        client_name=user_info["name"],
-        client_phone=user_info["phone"],
+        client_name=data["client_name"],
+        client_phone=data["client_phone"],
         notes=data.get("notes", ""),
     )
 
-    date_obj = datetime.strptime(data["date"], "%Y-%m-%d")
+    date_obj  = datetime.strptime(data["date"], "%Y-%m-%d")
+    user_info = {"name": data["client_name"], "phone": data["client_phone"]}
+
     await cb.message.edit_text(
         f"📋 <b>Заявка принята!</b>\n\n"
         f"💅 Услуга: <b>{data['service_name']}</b>\n"

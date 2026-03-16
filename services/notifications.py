@@ -184,13 +184,15 @@ async def notify_client_reschedule_offer(bot: Bot, apt: dict, new_date: str, new
             f"⏰ <b>Мастер предлагает перенести запись</b>\n\n"
             f"💅 {apt['service_name']}\n\n"
             f"Было: {DAY_NAMES_FULL[old_date_obj.weekday()]}, {old_date_obj.strftime('%d.%m.%Y')} в {apt['time']}\n"
-            f"Новое время: <b>{DAY_NAMES_FULL[new_date_obj.weekday()]}, {new_date_obj.strftime('%d.%m.%Y')} в {new_time}</b>\n\n"
-            f"Вы согласны?",
+            f"Предложено: <b>{DAY_NAMES_FULL[new_date_obj.weekday()]}, {new_date_obj.strftime('%d.%m.%Y')} в {new_time}</b>\n\n"
+            f"Вас устраивает это время?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="✅ Принять",  callback_data=f"reschedule_accept_{apt['id']}_{new_date}_{new_time}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reschedule_decline_{apt['id']}"),
-                ]
+                    InlineKeyboardButton(text="✅ Принять",            callback_data=f"reschedule_accept_{apt['id']}_{new_date}_{new_time}"),
+                ],
+                [
+                    InlineKeyboardButton(text="✍️ Предложить своё время", callback_data=f"reschedule_counter_{apt['id']}"),
+                ],
             ]),
             parse_mode=ParseMode.HTML,
         )

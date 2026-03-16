@@ -67,6 +67,13 @@ class Database:
         )
         return dict(row) if row else None
 
+    def clear_user_contact(self, telegram_id: int):
+        """Удаляет сохранённые имя и телефон пользователя"""
+        self._exec(
+            "UPDATE users SET name = NULL, phone = NULL WHERE telegram_id = %s",
+            (telegram_id,),
+        )
+
     def get_total_users(self) -> int:
         return self._exec("SELECT COUNT(*) FROM users", fetch="scalar") or 0
 

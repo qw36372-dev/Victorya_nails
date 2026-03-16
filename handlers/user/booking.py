@@ -1,13 +1,14 @@
 """
 handlers/user/booking.py — полный сценарий записи клиента (один мастер)
 
-Шаги: услуга → календарь → время → для кого? → имя/телефон → пожелания → подтверждение
+Каждый шаг удаляет предыдущее сообщение и отправляет новое — чат остаётся чистым.
 """
 
 from datetime import date, datetime
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -32,44 +33,47 @@ def _get_sole_master() -> dict:
     return masters[0] if masters else {"id": 1, "name": "Мастер"}
 
 
-# ── Вспомогательная: показать календарь ──────────────────────────────────────
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
-async def _show_calendar(target, state: FSMContext, year: int, month: int, edit: bool = True):
-    await state.set_state(Booking.select_date)
-    data      = await state.get_data()
-    available = get_available_dates_in_month(year, month, data["master_id"], data["service_duration"])
+async def _delete_last(bot: Bot, chat_id: int, state: FSMContext):
+    """Удаляет последнее сообщение бота если оно сохранено в состоянии."""
+    data = await state.get_data()
+    msg_id = data.get("last_bot_msg_id")
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except TelegramBadRequest:
+            pass
 
-    text = (
-        f"✅ Услуга: <b>{data['service_name']}</b>\n"
-        f"⏱ Длительность: {data['service_duration']} мин.\n"
-        f"💰 Стоимость: {data['service_price']}₽\n\n"
-        f"📅 <b>Выберите дату:</b>\n"
-        f"<i>Цифра — свободно   ✗ — занято   · — недоступно</i>"
-    )
-    kb = calendar_kb(year, month, available, data["service_id"])
 
-    if edit and isinstance(target, Message):
-        await target.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await target.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+async def _save_msg(msg: Message, state: FSMContext):
+    """Сохраняет ID отправленного сообщения в состоянии."""
+    await state.update_data(last_bot_msg_id=msg.message_id)
 
 
 # ── 1. Выбор услуги ──────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "book")
-async def cb_book(cb: CallbackQuery, state: FSMContext):
+async def cb_book(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await state.set_state(Booking.select_service)
     services = db.get_services()
-    await cb.message.edit_text(
+
+    await _delete_last(bot, cb.message.chat.id, state)
+    msg = await cb.message.answer(
         "💅 <b>Выберите услугу:</b>\n\nМаникюр, педикюр, наращивание и уход за ногтями ✨",
         reply_markup=services_kb(services),
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
 @router.callback_query(Booking.select_service, F.data.startswith("service_"))
-async def cb_select_service(cb: CallbackQuery, state: FSMContext):
+async def cb_select_service(cb: CallbackQuery, state: FSMContext, bot: Bot):
     service_id = int(cb.data.split("_")[1])
     service    = db.get_service(service_id)
     master     = _get_sole_master()
@@ -84,20 +88,43 @@ async def cb_select_service(cb: CallbackQuery, state: FSMContext):
     )
 
     today = date.today()
-    await _show_calendar(cb.message, state, today.year, today.month, edit=True)
+    await _show_calendar(cb.message, state, bot, today.year, today.month)
     await cb.answer()
 
 
 # ── 2. Навигация по месяцам ───────────────────────────────────────────────────
 
+async def _show_calendar(message: Message, state: FSMContext, bot: Bot, year: int, month: int):
+    await state.set_state(Booking.select_date)
+    data      = await state.get_data()
+    available = get_available_dates_in_month(year, month, data["master_id"], data["service_duration"])
+
+    text = (
+        f"✅ Услуга: <b>{data['service_name']}</b>\n"
+        f"⏱ Длительность: {data['service_duration']} мин.\n"
+        f"💰 Стоимость: {data['service_price']}₽\n\n"
+        f"📅 <b>Выберите дату:</b>\n"
+        f"<i>Цифра — свободно   ✗ — занято   · — недоступно</i>"
+    )
+    kb = calendar_kb(year, month, available, data["service_id"])
+
+    await _delete_last(bot, message.chat.id, state)
+    msg = await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await _save_msg(msg, state)
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
 @router.callback_query(Booking.select_date, F.data.startswith("cal_nav_"))
-async def cb_cal_nav(cb: CallbackQuery, state: FSMContext):
+async def cb_cal_nav(cb: CallbackQuery, state: FSMContext, bot: Bot):
     _, _, y, m = cb.data.split("_")
     today = date.today()
     if (int(y), int(m)) < (today.year, today.month):
         await cb.answer()
         return
-    await _show_calendar(cb.message, state, int(y), int(m), edit=True)
+    await _show_calendar(cb.message, state, bot, int(y), int(m))
     await cb.answer()
 
 
@@ -109,7 +136,7 @@ async def cb_cal_noop(cb: CallbackQuery):
 # ── 3. Выбор даты ─────────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.select_date, F.data.startswith("date_"))
-async def cb_select_date(cb: CallbackQuery, state: FSMContext):
+async def cb_select_date(cb: CallbackQuery, state: FSMContext, bot: Bot):
     date_str = cb.data.split("_")[1]
     await state.update_data(date=date_str)
     await state.set_state(Booking.select_time)
@@ -124,29 +151,38 @@ async def cb_select_date(cb: CallbackQuery, state: FSMContext):
         return
 
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-    await cb.message.edit_text(
+
+    await _delete_last(bot, cb.message.chat.id, state)
+    msg = await cb.message.answer(
         f"✅ Услуга: <b>{data['service_name']}</b>\n"
         f"📅 Дата: <b>{DAY_NAMES_FULL[date_obj.weekday()]}, {date_obj.strftime('%d.%m.%Y')}</b>\n\n"
         f"🕐 <b>Выберите время:</b>",
         reply_markup=times_kb(available, back_cb=f"service_{data['service_id']}"),
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
 # ── 4. Выбор времени → для кого? ─────────────────────────────────────────────
 
 @router.callback_query(Booking.select_time, F.data.startswith("time_"))
-async def cb_select_time(cb: CallbackQuery, state: FSMContext):
+async def cb_select_time(cb: CallbackQuery, state: FSMContext, bot: Bot):
     time_str = cb.data.split("_")[1]
     await state.update_data(time=time_str)
 
     user_info = db.get_user_info(cb.from_user.id)
+
+    await _delete_last(bot, cb.message.chat.id, state)
+
     if user_info and user_info.get("phone"):
-        # Знаем клиента — предлагаем выбор: для себя или для другого
         await state.update_data(saved_name=user_info["name"], saved_phone=user_info["phone"])
         await state.set_state(Booking.choose_client)
-        await cb.message.edit_text(
+        msg = await cb.message.answer(
             "👤 <b>Для кого запись?</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
@@ -161,95 +197,115 @@ async def cb_select_time(cb: CallbackQuery, state: FSMContext):
             parse_mode=ParseMode.HTML,
         )
     else:
-        # Новый клиент — сразу спрашиваем имя
         await state.set_state(Booking.enter_name)
-        await cb.message.edit_text(
+        msg = await cb.message.answer(
             "📝 <b>Введите ваше имя:</b>\n\nКак к вам обращаться?\n\n"
             "⚠️ <i>Имя и телефон сохранятся для ваших будущих записей. "
             "Удалить их можно в любой момент через главное меню.</i>",
             reply_markup=back_kb("book"),
             parse_mode=ParseMode.HTML,
         )
+
+    await _save_msg(msg, state)
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
 # ── 4а. Для себя ──────────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.choose_client, F.data == "client_self")
-async def cb_client_self(cb: CallbackQuery, state: FSMContext):
+async def cb_client_self(cb: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     await state.update_data(client_name=data["saved_name"], client_phone=data["saved_phone"])
-    await _ask_notes(cb.message, state, edit=True)
+    await _ask_notes(cb.message, state, bot)
     await cb.answer()
 
 
-# ── 4б. Для другого — запрашиваем имя ────────────────────────────────────────
+# ── 4б. Для другого ───────────────────────────────────────────────────────────
 
 @router.callback_query(Booking.choose_client, F.data == "client_other")
-async def cb_client_other(cb: CallbackQuery, state: FSMContext):
+async def cb_client_other(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await state.set_state(Booking.enter_other_name)
-    await cb.message.edit_text(
+    await _delete_last(bot, cb.message.chat.id, state)
+    msg = await cb.message.answer(
         "📝 <b>Введите имя человека, для которого запись:</b>",
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
-# ── 4в. Имя другого человека ──────────────────────────────────────────────────
+# ── 4в. Имя другого ───────────────────────────────────────────────────────────
 
 @router.message(Booking.enter_other_name, F.text)
-async def msg_enter_other_name(message: Message, state: FSMContext):
+async def msg_enter_other_name(message: Message, state: FSMContext, bot: Bot):
     name = message.text.strip()
     if len(name) < 2:
         await message.answer("❗ Пожалуйста, введите корректное имя (минимум 2 символа).")
+        await message.delete()
         return
     await state.update_data(client_name=name)
     await state.set_state(Booking.enter_other_phone)
-    await message.answer(
-        "📱 <b>Введите номер телефона этого человека:</b>\n\n"
-        "Например: +79001234567",
+
+    await _delete_last(bot, message.chat.id, state)
+    await message.delete()
+    msg = await message.answer(
+        "📱 <b>Введите номер телефона этого человека:</b>\n\nНапример: +79001234567",
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
 
 
-# ── 4г. Телефон другого человека ─────────────────────────────────────────────
+# ── 4г. Телефон другого ───────────────────────────────────────────────────────
 
 @router.message(Booking.enter_other_phone, F.text)
-async def msg_enter_other_phone(message: Message, state: FSMContext):
+async def msg_enter_other_phone(message: Message, state: FSMContext, bot: Bot):
     phone = message.text.strip()
     if len("".join(filter(str.isdigit, phone))) < 10:
         await message.answer("❗ Пожалуйста, введите корректный номер телефона.")
+        await message.delete()
         return
-    # Нормализуем номер
     digits = "".join(filter(str.isdigit, phone))
     phone  = f"+{digits}"
-    # Сохраняем данные другого человека — в таблицу users НЕ пишем
     await state.update_data(client_phone=phone)
-    await _ask_notes(message, state, edit=False)
+    await message.delete()
+    await _ask_notes(message, state, bot)
 
 
-# ── 5. Имя (новый клиент) ─────────────────────────────────────────────────────
+# ── 5. Имя нового клиента ─────────────────────────────────────────────────────
 
 @router.message(Booking.enter_name, F.text)
-async def msg_enter_name(message: Message, state: FSMContext):
+async def msg_enter_name(message: Message, state: FSMContext, bot: Bot):
     name = message.text.strip()
     if len(name) < 2:
         await message.answer("❗ Пожалуйста, введите корректное имя (минимум 2 символа).")
+        await message.delete()
         return
     await state.update_data(client_name=name)
     await state.set_state(Booking.enter_phone)
-    await message.answer(
+
+    await _delete_last(bot, message.chat.id, state)
+    await message.delete()
+    msg = await message.answer(
         "📱 <b>Укажите номер телефона:</b>\n\n"
         "Нажмите кнопку или введите вручную (например: +79001234567)",
         reply_markup=phone_request_kb(),
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
 
 
-# ── 6. Телефон (новый клиент) ─────────────────────────────────────────────────
+# ── 6. Телефон нового клиента ─────────────────────────────────────────────────
 
 @router.message(Booking.enter_phone, F.contact | F.text)
-async def msg_enter_phone(message: Message, state: FSMContext):
+async def msg_enter_phone(message: Message, state: FSMContext, bot: Bot):
     if message.contact:
         phone = message.contact.phone_number
         if not phone.startswith("+"):
@@ -261,20 +317,20 @@ async def msg_enter_phone(message: Message, state: FSMContext):
                 "❗ Пожалуйста, введите корректный номер телефона.",
                 reply_markup=remove_kb(),
             )
+            await message.delete()
             return
 
     data = await state.get_data()
     name = data.get("client_name", message.from_user.first_name)
-    # Сохраняем в БД — это данные самого клиента
     db.update_user_contact(message.from_user.id, name, phone)
     await state.update_data(client_phone=phone)
-    await message.answer("✅", reply_markup=remove_kb())
-    await _ask_notes(message, state, edit=False)
+    await message.delete()
+    await _ask_notes(message, state, bot)
 
 
 # ── 7. Пожелания ─────────────────────────────────────────────────────────────
 
-async def _ask_notes(target, state: FSMContext, edit: bool = False):
+async def _ask_notes(target: Message, state: FSMContext, bot: Bot):
     await state.set_state(Booking.enter_notes)
     text = (
         "💬 <b>Дополнительная информация</b>\n\n"
@@ -282,32 +338,32 @@ async def _ask_notes(target, state: FSMContext, edit: bool = False):
         "<i>Например: форма ногтей, длина, желаемый дизайн, "
         "аллергия на материалы, особенности ногтевой пластины и т.д.</i>"
     )
-    if edit and isinstance(target, Message):
-        await target.edit_text(text, reply_markup=notes_kb(), parse_mode=ParseMode.HTML)
-    else:
-        await target.answer(text, reply_markup=notes_kb(), parse_mode=ParseMode.HTML)
+    await _delete_last(bot, target.chat.id, state)
+    msg = await target.answer(text, reply_markup=notes_kb(), parse_mode=ParseMode.HTML)
+    await _save_msg(msg, state)
 
 
 @router.message(Booking.enter_notes, F.text)
-async def msg_enter_notes(message: Message, state: FSMContext):
+async def msg_enter_notes(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(notes=message.text.strip()[:500])
+    await message.delete()
     data      = await state.get_data()
     user_info = {"name": data["client_name"], "phone": data["client_phone"]}
-    await _show_confirmation(message, state, user_info, edit=False)
+    await _show_confirmation(message, state, bot, user_info)
 
 
 @router.callback_query(Booking.enter_notes, F.data == "notes_skip")
-async def cb_notes_skip(cb: CallbackQuery, state: FSMContext):
+async def cb_notes_skip(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await state.update_data(notes="")
     data      = await state.get_data()
     user_info = {"name": data["client_name"], "phone": data["client_phone"]}
-    await _show_confirmation(cb.message, state, user_info, edit=True)
+    await _show_confirmation(cb.message, state, bot, user_info)
     await cb.answer()
 
 
 # ── 8. Подтверждение ─────────────────────────────────────────────────────────
 
-async def _show_confirmation(target, state: FSMContext, user_info: dict, edit: bool = False):
+async def _show_confirmation(target: Message, state: FSMContext, bot: Bot, user_info: dict):
     data     = await state.get_data()
     date_obj = datetime.strptime(data["date"], "%Y-%m-%d")
     end_time = calc_end_time(data["date"], data["time"], data["service_duration"])
@@ -325,10 +381,13 @@ async def _show_confirmation(target, state: FSMContext, user_info: dict, edit: b
         f"\n✅ Подтвердить запись?"
     )
     await state.set_state(Booking.confirm)
-    if edit and isinstance(target, Message):
-        await target.edit_text(text, reply_markup=confirm_booking_kb(), parse_mode=ParseMode.HTML)
-    else:
-        await target.answer(text, reply_markup=confirm_booking_kb(), parse_mode=ParseMode.HTML)
+    await _delete_last(bot, target.chat.id, state)
+    msg = await target.answer(text, reply_markup=confirm_booking_kb(), parse_mode=ParseMode.HTML)
+    await _save_msg(msg, state)
+    try:
+        await target.delete()
+    except TelegramBadRequest:
+        pass
 
 
 # ── 9. Запись создана ────────────────────────────────────────────────────────
@@ -352,7 +411,8 @@ async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot):
     date_obj  = datetime.strptime(data["date"], "%Y-%m-%d")
     user_info = {"name": data["client_name"], "phone": data["client_phone"]}
 
-    await cb.message.edit_text(
+    await _delete_last(bot, cb.message.chat.id, state)
+    msg = await cb.message.answer(
         f"📋 <b>Заявка принята!</b>\n\n"
         f"💅 Услуга: <b>{data['service_name']}</b>\n"
         f"📅 <b>{DAY_NAMES_FULL[date_obj.weekday()]}, {date_obj.strftime('%d.%m.%Y')} в {data['time']}</b>\n\n"
@@ -361,6 +421,11 @@ async def cb_confirm_booking(cb: CallbackQuery, state: FSMContext, bot: Bot):
         reply_markup=after_booking_kb(),
         parse_mode=ParseMode.HTML,
     )
+    await _save_msg(msg, state)
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
 
     await notify_channel_new(bot, apt_id, user_id, data, user_info)
     await state.clear()

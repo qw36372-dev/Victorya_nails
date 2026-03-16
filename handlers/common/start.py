@@ -4,6 +4,7 @@ handlers/common/start.py — /start и главное меню
 
 from aiogram import F, Router
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -49,12 +50,17 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     user_info   = db.get_user_info(cb.from_user.id)
     has_contact = bool(user_info and user_info.get("phone"))
-    await cb.message.edit_text(
+
+    msg = await cb.message.answer(
         f"💅 Личный бот мастера <b>{MASTER_NAME}</b>\n\n"
         f"Выберите нужный раздел:",
         reply_markup=main_menu_kb(cb.from_user.id, has_contact=has_contact),
         parse_mode=ParseMode.HTML,
     )
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
@@ -64,26 +70,32 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
 async def cb_clear_my_data(cb: CallbackQuery):
     user_info = db.get_user_info(cb.from_user.id)
     name      = user_info.get("name", "") if user_info else ""
-    await cb.message.edit_text(
+
+    msg = await cb.message.answer(
         f"🗑 <b>Удалить сохранённые данные?</b>\n\n"
         f"Имя: <b>{name}</b>\n\n"
         f"После удаления при следующей записи бот снова попросит "
         f"ввести имя и телефон.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Да, удалить",  callback_data="clear_confirm"),
-                InlineKeyboardButton(text="❌ Отмена",       callback_data="main_menu"),
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data="clear_confirm"),
+                InlineKeyboardButton(text="❌ Отмена",      callback_data="main_menu"),
             ]
         ]),
         parse_mode=ParseMode.HTML,
     )
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 
 @router.callback_query(F.data == "clear_confirm")
 async def cb_clear_confirm(cb: CallbackQuery):
     db.clear_user_contact(cb.from_user.id)
-    await cb.message.edit_text(
+
+    msg = await cb.message.answer(
         "✅ <b>Данные удалены.</b>\n\n"
         "При следующей записи вас попросят ввести имя и телефон заново.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -91,4 +103,8 @@ async def cb_clear_confirm(cb: CallbackQuery):
         ]),
         parse_mode=ParseMode.HTML,
     )
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.answer()

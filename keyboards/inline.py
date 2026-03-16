@@ -220,6 +220,86 @@ def channel_buttons_kb(tg_id: int, phone: str) -> InlineKeyboardMarkup:
     ]])
 
 
+# ── Перенос записи: календарь для мастера ────────────────────────────────────
+
+def reschedule_calendar_kb(year: int, month: int, apt_id: int) -> InlineKeyboardMarkup:
+    """Календарь для выбора новой даты переноса (все рабочие дни кликабельны)."""
+    today = date.today()
+    rows  = []
+
+    prev_m = month - 1 if month > 1 else 12
+    prev_y = year if month > 1 else year - 1
+    next_m = month + 1 if month < 12 else 1
+    next_y = year if month < 12 else year + 1
+
+    max_m     = today.month + 12
+    max_year  = today.year + (max_m - 1) // 12
+    max_month = (max_m - 1) % 12 + 1
+
+    can_prev = (prev_y, prev_m) >= (today.year, today.month)
+    can_next = (next_y, next_m) <= (max_year, max_month)
+
+    MONTH_NAMES_LOCAL = [
+        "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    ]
+
+    rows.append([
+        InlineKeyboardButton(
+            text="◀️" if can_prev else " ",
+            callback_data=f"rescal_nav_{apt_id}_{prev_y}_{prev_m}" if can_prev else "rescal_noop",
+        ),
+        InlineKeyboardButton(text=f"{MONTH_NAMES_LOCAL[month]} {year}", callback_data="rescal_noop"),
+        InlineKeyboardButton(
+            text="▶️" if can_next else " ",
+            callback_data=f"rescal_nav_{apt_id}_{next_y}_{next_m}" if can_next else "rescal_noop",
+        ),
+    ])
+
+    rows.append([
+        InlineKeyboardButton(text=d, callback_data="rescal_noop")
+        for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    ])
+
+    import calendar as _cal
+    for week in _cal.monthcalendar(year, month):
+        row = []
+        for weekday, day in enumerate(week):
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="rescal_noop"))
+            elif weekday == 6:
+                row.append(InlineKeyboardButton(text="·", callback_data="rescal_noop"))
+            else:
+                d_obj    = date(year, month, day)
+                date_str = d_obj.strftime("%Y-%m-%d")
+                if d_obj <= today:
+                    row.append(InlineKeyboardButton(text="·", callback_data="rescal_noop"))
+                else:
+                    row.append(InlineKeyboardButton(text=str(day), callback_data=f"rescal_date_{apt_id}_{date_str}"))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"apt_cancel_{apt_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reschedule_times_kb(available: list, apt_id: int, date_str: str) -> InlineKeyboardMarkup:
+    """Выбор времени для переноса."""
+    rows, row = [], []
+    for i, slot in enumerate(available):
+        row.append(InlineKeyboardButton(
+            text=slot,
+            callback_data=f"rescal_time_{apt_id}_{date_str}_{slot}",
+        ))
+        if len(row) == 4 or i == len(available) - 1:
+            rows.append(row)
+            row = []
+    # Назад — в календарь текущего месяца
+    import datetime as _dt
+    d = _dt.datetime.strptime(date_str, "%Y-%m-%d")
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"rescal_nav_{apt_id}_{d.year}_{d.month}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # ── Админ панель ─────────────────────────────────────────────────────────────
 
 def admin_menu_kb() -> InlineKeyboardMarkup:

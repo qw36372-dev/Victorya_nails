@@ -18,13 +18,15 @@ MONTH_NAMES = [
 
 # ── Общие ────────────────────────────────────────────────────────────────────
 
-def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+def main_menu_kb(user_id: int, has_contact: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="💅 Записаться на услугу", callback_data="book")],
         [InlineKeyboardButton(text="📋 Мои записи",           callback_data="my_appointments")],
         [InlineKeyboardButton(text="💰 Прайс-лист",           callback_data="price_list")],
         [InlineKeyboardButton(text="📍 Контакты и адрес",     callback_data="contacts")],
     ]
+    if has_contact:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить мои данные", callback_data="clear_my_data")])
     if user_id in ADMIN_IDS:
         rows.append([InlineKeyboardButton(text="⚙️ Панель администратора", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

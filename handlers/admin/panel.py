@@ -2,31 +2,32 @@
 handlers/admin/panel.py — панель администратора + подтверждение/отмена/перенос записей
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ADMIN_IDS
-from keyboards.inline import admin_menu_kb, back_kb
+from keyboards.inline import (
+    admin_menu_kb, back_kb,
+    reschedule_calendar_kb, reschedule_times_kb,
+)
 from services.notifications import (
     notify_client_confirmed,
     notify_client_cancelled_by_master,
     notify_client_reschedule_offer,
     send_reminder,
 )
+from services.schedule import get_available_slots
 from states import Admin, AdminReschedule
 from storage.database import db
 
 router = Router()
 
-# Временное хранилище: {admin_tg_id: apt_id} — для флоу переноса записи
-_reschedule_pending: dict[int, int] = {}
 
-
-# ── Главное меню админа ───────────────────────────────────────────────────────
+# ── Главное меню ──────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "admin")
 async def cb_admin(cb: CallbackQuery, state: FSMContext):
@@ -38,7 +39,6 @@ async def cb_admin(cb: CallbackQuery, state: FSMContext):
     today     = datetime.now().strftime("%Y-%m-%d")
     today_apt = db.get_appointments_by_date(today)
     pending   = db.get_pending_appointments()
-
     pending_line = f"\n⏳ Ожидают подтверждения: <b>{len(pending)}</b>" if pending else ""
 
     await cb.message.edit_text(
@@ -71,9 +71,9 @@ async def cb_admin_appointments(cb: CallbackQuery):
     else:
         text = f"📅 <b>Записи {label} ({date_obj.strftime('%d.%m.%Y')}):</b>\n\n"
         for apt in sorted(apts, key=lambda x: x["time"]):
-            status_icon = "✅" if apt["status"] == "active" else "⏳"
+            icon = "✅" if apt["status"] == "active" else "⏳"
             text += (
-                f"{status_icon} <b>{apt['time']}</b> — {apt['service_name']}\n"
+                f"{icon} <b>{apt['time']}</b> — {apt['service_name']}\n"
                 f"   👤 {apt['client_name']} ({apt['client_phone']})\n\n"
             )
 
@@ -100,7 +100,7 @@ async def cb_admin_stats(cb: CallbackQuery):
     await cb.answer()
 
 
-# ── Подтверждение записи мастером ─────────────────────────────────────────────
+# ── Подтверждение записи ──────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("apt_confirm_"))
 async def cb_apt_confirm(cb: CallbackQuery, bot: Bot, scheduler):
@@ -118,9 +118,8 @@ async def cb_apt_confirm(cb: CallbackQuery, bot: Bot, scheduler):
         return
 
     db.confirm_appointment(apt_id)
-    apt = db.get_appointment(apt_id)   # обновлённые данные
+    apt = db.get_appointment(apt_id)
 
-    # Планируем напоминания
     apt_dt = datetime.strptime(f"{apt['date']} {apt['time']}", "%Y-%m-%d %H:%M")
     for hours, label in [(24, "24h"), (2, "2h")]:
         run_at = apt_dt - timedelta(hours=hours)
@@ -131,7 +130,6 @@ async def cb_apt_confirm(cb: CallbackQuery, bot: Bot, scheduler):
                 id=f"reminder_{label}_{apt_id}", replace_existing=True,
             )
 
-    # Редактируем сообщение в канале
     date_obj = datetime.strptime(apt["date"], "%Y-%m-%d")
     try:
         await cb.message.edit_text(
@@ -145,7 +143,6 @@ async def cb_apt_confirm(cb: CallbackQuery, bot: Bot, scheduler):
     except Exception:
         pass
 
-    # Уведомляем клиента
     await notify_client_confirmed(bot, apt)
     await cb.answer("✅ Запись подтверждена, клиент уведомлён")
 
@@ -166,7 +163,6 @@ async def cb_apt_cancel(cb: CallbackQuery, bot: Bot, scheduler):
 
     db.cancel_appointment(apt_id)
 
-    # Удаляем напоминания если были
     for job_id in [f"reminder_24h_{apt_id}", f"reminder_2h_{apt_id}"]:
         try:
             scheduler.remove_job(job_id)
@@ -189,13 +185,12 @@ async def cb_apt_cancel(cb: CallbackQuery, bot: Bot, scheduler):
     await cb.answer("❌ Запись отменена, клиент уведомлён")
 
 
-# ── Предложить другое время ───────────────────────────────────────────────────
+# ── Перенос: мастер открывает календарь ──────────────────────────────────────
 
 @router.callback_query(F.data.startswith("apt_reschedule_"))
-async def cb_apt_reschedule(cb: CallbackQuery, bot: Bot, state: FSMContext):
-    apt_id    = int(cb.data.split("_")[2])
-    apt       = db.get_appointment(apt_id)
-    admin_id  = cb.from_user.id
+async def cb_apt_reschedule(cb: CallbackQuery, state: FSMContext):
+    apt_id = int(cb.data.split("_")[2])
+    apt    = db.get_appointment(apt_id)
 
     if not apt:
         await cb.answer("Запись не найдена", show_alert=True)
@@ -204,78 +199,135 @@ async def cb_apt_reschedule(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.answer("Запись уже отменена", show_alert=True)
         return
 
-    # Сохраняем в памяти: какую запись переносим
-    _reschedule_pending[admin_id] = apt_id
+    await state.update_data(reschedule_apt_id=apt_id)
+    await state.set_state(AdminReschedule.select_date)
 
-    # Отправляем мастеру личное сообщение с инструкцией
+    today = date.today()
     date_obj = datetime.strptime(apt["date"], "%Y-%m-%d")
+
     try:
-        await bot.send_message(
-            admin_id,
+        await cb.message.edit_text(
             f"⏰ <b>Перенос записи #{apt_id}</b>\n\n"
-            f"👤 {apt['client_name']}\n"
-            f"💅 {apt['service_name']}\n"
+            f"👤 {apt['client_name']} — {apt['service_name']}\n"
             f"Текущее время: {date_obj.strftime('%d.%m.%Y')} в {apt['time']}\n\n"
-            f"Введите новую дату и время в формате:\n"
-            f"<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
-            f"Например: <code>25.04.2026 14:00</code>",
+            f"📅 <b>Выберите новую дату:</b>",
+            reply_markup=reschedule_calendar_kb(today.year, today.month, apt_id),
             parse_mode=ParseMode.HTML,
         )
-        await cb.answer("Отправил вам сообщение в личку 👆")
-    except Exception as e:
-        await cb.answer(f"Не могу написать в личку. Убедитесь, что запустили бота.", show_alert=True)
-        return
-
-    # Устанавливаем состояние ожидания нового времени
-    await state.set_state(AdminReschedule.enter_datetime)
-
-
-# ── Обработка ввода нового времени от мастера ─────────────────────────────────
-
-@router.message(AdminReschedule.enter_datetime, F.text)
-async def msg_reschedule_datetime(message: Message, state: FSMContext, bot: Bot):
-    admin_id = message.from_user.id
-
-    if admin_id not in _reschedule_pending:
-        await message.answer("❗ Нет активного переноса. Нажмите кнопку в канале ещё раз.")
-        await state.clear()
-        return
-
-    apt_id = _reschedule_pending[admin_id]
-    text   = message.text.strip()
-
-    try:
-        new_dt   = datetime.strptime(text, "%d.%m.%Y %H:%M")
-        new_date = new_dt.strftime("%Y-%m-%d")
-        new_time = new_dt.strftime("%H:%M")
-    except ValueError:
-        await message.answer(
-            "❗ Неверный формат. Введите дату и время так:\n"
-            "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\nНапример: <code>25.04.2026 14:00</code>",
+    except Exception:
+        # Если сообщение из канала — отправляем в личку
+        await cb.bot.send_message(
+            cb.from_user.id,
+            f"⏰ <b>Перенос записи #{apt_id}</b>\n\n"
+            f"👤 {apt['client_name']} — {apt['service_name']}\n"
+            f"Текущее время: {date_obj.strftime('%d.%m.%Y')} в {apt['time']}\n\n"
+            f"📅 <b>Выберите новую дату:</b>",
+            reply_markup=reschedule_calendar_kb(today.year, today.month, apt_id),
             parse_mode=ParseMode.HTML,
         )
+    await cb.answer()
+
+
+# ── Перенос: навигация по месяцам ────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("rescal_nav_"))
+async def cb_rescal_nav(cb: CallbackQuery, state: FSMContext):
+    # rescal_nav_{apt_id}_{year}_{month}
+    parts  = cb.data.split("_")
+    apt_id = int(parts[2])
+    year   = int(parts[3])
+    month  = int(parts[4])
+
+    apt      = db.get_appointment(apt_id)
+    date_obj = datetime.strptime(apt["date"], "%Y-%m-%d")
+
+    await cb.message.edit_text(
+        f"⏰ <b>Перенос записи #{apt_id}</b>\n\n"
+        f"👤 {apt['client_name']} — {apt['service_name']}\n"
+        f"Текущее время: {date_obj.strftime('%d.%m.%Y')} в {apt['time']}\n\n"
+        f"📅 <b>Выберите новую дату:</b>",
+        reply_markup=reschedule_calendar_kb(year, month, apt_id),
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "rescal_noop")
+async def cb_rescal_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+# ── Перенос: мастер выбрал дату → показываем слоты ───────────────────────────
+
+@router.callback_query(F.data.startswith("rescal_date_"))
+async def cb_rescal_date(cb: CallbackQuery, state: FSMContext):
+    # rescal_date_{apt_id}_{date_str}
+    parts    = cb.data.split("_")
+    apt_id   = int(parts[2])
+    date_str = parts[3]
+
+    await state.update_data(reschedule_apt_id=apt_id, reschedule_date=date_str)
+    await state.set_state(AdminReschedule.select_time)
+
+    apt       = db.get_appointment(apt_id)
+    master_id = apt["master_id"]
+    booked    = db.get_booked_slots(master_id, date_str)
+    available = get_available_slots(date_str, apt["duration"] if "duration" in apt else 60, booked)
+
+    # Получаем длительность услуги
+    service = db.get_service(apt["service_id"])
+    duration = service["duration"] if service else 60
+    available = get_available_slots(date_str, duration, booked)
+
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+
+    if not available:
+        await cb.answer("😔 На эту дату нет свободных слотов", show_alert=True)
         return
+
+    await cb.message.edit_text(
+        f"⏰ <b>Перенос записи #{apt_id}</b>\n\n"
+        f"📅 Дата: <b>{date_obj.strftime('%d.%m.%Y')}</b>\n\n"
+        f"🕐 <b>Выберите время:</b>",
+        reply_markup=reschedule_times_kb(available, apt_id, date_str),
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+# ── Перенос: мастер выбрал время → отправляем предложение клиенту ────────────
+
+@router.callback_query(AdminReschedule.select_time, F.data.startswith("rescal_time_"))
+async def cb_rescal_time(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    # rescal_time_{apt_id}_{date_str}_{time_str}
+    parts    = cb.data.split("_")
+    apt_id   = int(parts[2])
+    date_str = parts[3]
+    time_str = parts[4]
 
     apt = db.get_appointment(apt_id)
     if not apt:
-        await message.answer("❗ Запись не найдена.")
-        del _reschedule_pending[admin_id]
-        await state.clear()
+        await cb.answer("Запись не найдена", show_alert=True)
         return
 
-    # Отправляем клиенту предложение
-    await notify_client_reschedule_offer(bot, apt, new_date, new_time)
+    new_dt   = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    old_date = datetime.strptime(apt["date"], "%Y-%m-%d")
 
-    del _reschedule_pending[admin_id]
-    await state.clear()
-
-    new_dt_fmt = new_dt.strftime("%d.%m.%Y в %H:%M")
-    await message.answer(
-        f"✅ Предложение отправлено клиенту {apt['client_name']}.\n"
-        f"Предложенное время: <b>{new_dt_fmt}</b>\n\n"
-        f"Ожидаем ответа клиента.",
+    # Подтверждение мастеру
+    await cb.message.edit_text(
+        f"⏰ <b>Предложение отправлено клиенту!</b>\n\n"
+        f"👤 {apt['client_name']} — {apt['service_name']}\n"
+        f"Было: {old_date.strftime('%d.%m.%Y')} в {apt['time']}\n"
+        f"Предложено: <b>{new_dt.strftime('%d.%m.%Y')} в {time_str}</b>\n\n"
+        f"<i>Ожидаем ответа клиента...</i>",
         parse_mode=ParseMode.HTML,
     )
+
+    await state.clear()
+
+    # Уведомляем клиента
+    await notify_client_reschedule_offer(bot, apt, date_str, time_str)
+    await cb.answer("✅ Предложение отправлено клиенту")
 
 
 # ── Клиент принимает перенос ──────────────────────────────────────────────────
@@ -283,7 +335,6 @@ async def msg_reschedule_datetime(message: Message, state: FSMContext, bot: Bot)
 @router.callback_query(F.data.startswith("reschedule_accept_"))
 async def cb_reschedule_accept(cb: CallbackQuery, bot: Bot, scheduler):
     parts    = cb.data.split("_")
-    # reschedule_accept_{apt_id}_{date}_{time}
     apt_id   = int(parts[2])
     new_date = parts[3]
     new_time = parts[4]
@@ -297,7 +348,6 @@ async def cb_reschedule_accept(cb: CallbackQuery, bot: Bot, scheduler):
     db.confirm_appointment(apt_id)
     apt = db.get_appointment(apt_id)
 
-    # Перепланируем напоминания
     for job_id in [f"reminder_24h_{apt_id}", f"reminder_2h_{apt_id}"]:
         try:
             scheduler.remove_job(job_id)
@@ -314,7 +364,7 @@ async def cb_reschedule_accept(cb: CallbackQuery, bot: Bot, scheduler):
                 id=f"reminder_{label}_{apt_id}", replace_existing=True,
             )
 
-    new_dt   = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+    new_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
     await cb.message.edit_text(
         f"✅ <b>Перенос подтверждён!</b>\n\n"
         f"💅 {apt['service_name']}\n"
@@ -322,34 +372,140 @@ async def cb_reschedule_accept(cb: CallbackQuery, bot: Bot, scheduler):
         f"Ждём вас! 💅🌸",
         parse_mode=ParseMode.HTML,
     )
+
+    # Уведомляем мастера
+    try:
+        for admin_id in ADMIN_IDS:
+            await bot.send_message(
+                admin_id,
+                f"✅ Клиент <b>{apt['client_name']}</b> принял перенос записи #{apt_id}.\n"
+                f"Новое время: <b>{new_dt.strftime('%d.%m.%Y')} в {new_time}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        pass
+
     await cb.answer("✅ Принято!")
 
 
-# ── Клиент отклоняет перенос ──────────────────────────────────────────────────
+# ── Клиент предлагает своё время ──────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("reschedule_decline_"))
-async def cb_reschedule_decline(cb: CallbackQuery, bot: Bot):
+@router.callback_query(F.data.startswith("reschedule_counter_"))
+async def cb_reschedule_counter(cb: CallbackQuery, state: FSMContext):
     apt_id = int(cb.data.split("_")[2])
-    apt    = db.get_appointment(apt_id)
-
-    db.cancel_appointment(apt_id)
+    from states import ClientCounter
+    await state.set_state(ClientCounter.enter_datetime)
+    await state.update_data(counter_apt_id=apt_id)
 
     await cb.message.edit_text(
-        "❌ Вы отклонили предложение о переносе.\n\n"
-        "Запись отменена. Если хотите записаться — выберите удобное время.",
-        reply_markup=None,
+        f"✍️ <b>Введите удобную вам дату и время:</b>\n\n"
+        f"Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+        f"Например: <code>25.04.2026 14:00</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+@router.message(F.text)
+async def msg_client_counter(message: Message, state: FSMContext, bot: Bot):
+    from states import ClientCounter
+    current = await state.get_state()
+    if current != ClientCounter.enter_datetime:
+        return
+
+    data   = await state.get_data()
+    apt_id = data.get("counter_apt_id")
+    text   = message.text.strip()
+
+    try:
+        new_dt   = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        new_date = new_dt.strftime("%Y-%m-%d")
+        new_time = new_dt.strftime("%H:%M")
+    except ValueError:
+        await message.answer(
+            "❗ Неверный формат. Введите дату и время так:\n"
+            "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\nНапример: <code>25.04.2026 14:00</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    apt = db.get_appointment(apt_id)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Ваше пожелание отправлено мастеру!\n\n"
+        f"Предложенное время: <b>{new_dt.strftime('%d.%m.%Y')} в {new_time}</b>\n\n"
+        f"Ожидайте подтверждения.",
+        parse_mode=ParseMode.HTML,
     )
 
-    # Уведомляем мастера
+    # Отправляем мастеру встречное предложение клиента
     if apt:
         try:
-            for admin_id in __import__("config").ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
                 await bot.send_message(
                     admin_id,
-                    f"❌ Клиент <b>{apt['client_name']}</b> отклонил предложение о переносе записи #{apt_id}.",
+                    f"✍️ <b>Клиент предложил своё время!</b>\n\n"
+                    f"👤 {apt['client_name']} ({apt['client_phone']})\n"
+                    f"💅 {apt['service_name']}\n"
+                    f"Предложенное время: <b>{new_dt.strftime('%d.%m.%Y')} в {new_time}</b>\n\n"
+                    f"Подтвердите или измените запись.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="✅ Подтвердить",  callback_data=f"counter_confirm_{apt_id}_{new_date}_{new_time}"),
+                            InlineKeyboardButton(text="⏰ Другое время", callback_data=f"apt_reschedule_{apt_id}"),
+                        ],
+                        [
+                            InlineKeyboardButton(text="❌ Отменить",     callback_data=f"apt_cancel_{apt_id}"),
+                        ],
+                    ]),
                     parse_mode=ParseMode.HTML,
                 )
         except Exception:
             pass
 
-    await cb.answer("Отклонено")
+
+# ── Мастер подтверждает время клиента ─────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("counter_confirm_"))
+async def cb_counter_confirm(cb: CallbackQuery, bot: Bot, scheduler):
+    parts    = cb.data.split("_")
+    apt_id   = int(parts[2])
+    new_date = parts[3]
+    new_time = parts[4]
+
+    db.reschedule_appointment(apt_id, new_date, new_time)
+    db.confirm_appointment(apt_id)
+    apt = db.get_appointment(apt_id)
+
+    for job_id in [f"reminder_24h_{apt_id}", f"reminder_2h_{apt_id}"]:
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+
+    apt_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+    for hours, label in [(24, "24h"), (2, "2h")]:
+        run_at = apt_dt - timedelta(hours=hours)
+        if run_at > datetime.now():
+            scheduler.add_job(
+                send_reminder, "date", run_date=run_at,
+                args=[bot, apt["client_telegram_id"], apt_id, label],
+                id=f"reminder_{label}_{apt_id}", replace_existing=True,
+            )
+
+    new_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+
+    try:
+        await cb.message.edit_text(
+            f"✅ <b>Время клиента подтверждено #{apt_id}</b>\n\n"
+            f"👤 {apt['client_name']}\n"
+            f"💅 {apt['service_name']}\n"
+            f"📅 {new_dt.strftime('%d.%m.%Y')} в {new_time}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    await notify_client_confirmed(bot, apt)
+    await cb.answer("✅ Подтверждено, клиент уведомлён")

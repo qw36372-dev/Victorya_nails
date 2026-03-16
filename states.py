@@ -34,5 +34,11 @@ class Admin(StatesGroup):
 
 
 class AdminReschedule(StatesGroup):
-    """Предложение нового времени клиенту"""
-    enter_datetime = State()   # мастер вводит новую дату и время
+    """Предложение нового времени клиенту — мастер выбирает через календарь"""
+    select_date = State()   # мастер выбирает дату в календаре
+    select_time = State()   # мастер выбирает время
+
+
+class ClientCounter(StatesGroup):
+    """Клиент предлагает своё время в ответ на перенос"""
+    enter_datetime = State()
